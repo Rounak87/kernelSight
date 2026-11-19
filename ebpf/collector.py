@@ -1,4 +1,3 @@
-from bcc import BPF
 import time
 import json
 import argparse
@@ -8,166 +7,101 @@ import signal
 import sys
 from datetime import datetime
 
-BPF_PROGRAM = r"""
-#include <uapi/linux/ptrace.h>
-#include <linux/sched.h>
+try:
+    from bcc import BPF
+except ImportError:
+    BPF = None  # Handled in main() for non-Linux or testing environments
 
-struct proc_metrics {
-    u64 total_stall_ns;
-    u64 stall_count;
-    u64 involuntary_switches;
-    u64 voluntary_switches;
-    u64 major_faults;
-    u64 minor_faults;
-    u64 total_syscall_ns;
-    u64 syscall_count;
-    u64 total_lock_wait_ns;
-    u64 lock_wait_count;
-    char comm[16];
-};
+# Path to the kernel eBPF C probes program
+C_SOURCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "collector.c")
 
-BPF_HASH(metrics, u32, struct proc_metrics);
-BPF_HASH(sched_start, u32, u64);
-BPF_HASH(syscall_start, u64, u64);
-BPF_HASH(lock_start, u64, u64);
+# In-memory discovery cache to prevent disk I/O storms against /proc
+_PID_SERVICE_CACHE = {}
+_CACHE_TTL_SECONDS = 180
 
-static inline struct proc_metrics *get_metrics(u32 pid) {
-    struct proc_metrics *m = metrics.lookup(&pid);
-    if (!m) {
-        struct proc_metrics zero = {};
-        bpf_get_current_comm(&zero.comm, sizeof(zero.comm));
-        metrics.update(&pid, &zero);
-        m = metrics.lookup(&pid);
-    }
-    return m;
+# Idle/housekeeping kernel threads that produce no application telemetry
+IGNORED_KERNEL_COMM = {
+    "swapper", "ksoftirqd", "kthreadd", "rcu_sched", "rcu_bh",
+    "migration", "watchdog", "cpuhp", "idle", "kcompactd0"
 }
 
-TRACEPOINT_PROBE(sched, sched_switch) {
-    u64 ts = bpf_ktime_get_ns();
-    u32 prev_pid = args->prev_pid;
-    u32 next_pid = args->next_pid;
-
-    if (prev_pid > 0) {
-        sched_start.update(&prev_pid, &ts);
-        struct proc_metrics *m = get_metrics(prev_pid);
-        if (m) {
-            if (args->prev_state != 0) {
-                m->involuntary_switches++;
-            } else {
-                m->voluntary_switches++;
-            }
-        }
-    }
-
-    if (next_pid > 0) {
-        u64 *start_ts = sched_start.lookup(&next_pid);
-        if (start_ts) {
-            u64 delta = ts - *start_ts;
-            if (delta < 10000000000ULL) {
-                struct proc_metrics *m = get_metrics(next_pid);
-                if (m) {
-                    m->total_stall_ns += delta;
-                    m->stall_count++;
-                }
-            }
-            sched_start.delete(&next_pid);
-        }
-    }
-
-    return 0;
-}
-
-TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
-    u64 tid = bpf_get_current_pid_tgid();
-    u64 ts = bpf_ktime_get_ns();
-    syscall_start.update(&tid, &ts);
-    return 0;
-}
-
-TRACEPOINT_PROBE(raw_syscalls, sys_exit) {
-    u64 tid = bpf_get_current_pid_tgid();
-    u64 *start_ts = syscall_start.lookup(&tid);
-    if (!start_ts) return 0;
-
-    u64 delta = bpf_ktime_get_ns() - *start_ts;
-    syscall_start.delete(&tid);
-
-    if (delta < 1000 || delta > 5000000000ULL) return 0;
-
-    u32 pid = tid >> 32;
-    struct proc_metrics *m = get_metrics(pid);
-    if (m) {
-        m->total_syscall_ns += delta;
-        m->syscall_count++;
-    }
-    return 0;
-}
-
-TRACEPOINT_PROBE(exceptions, page_fault_user) {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
-    struct proc_metrics *m = get_metrics(pid);
-    if (m) {
-        if (args->error_code & 1) {
-            m->minor_faults++;
-        } else {
-            m->major_faults++;
-        }
-    }
-    return 0;
-}
-
-int trace_futex_enter(struct pt_regs *ctx) {
-    u64 tid = bpf_get_current_pid_tgid();
-    u64 ts = bpf_ktime_get_ns();
-    lock_start.update(&tid, &ts);
-    return 0;
-}
-
-int trace_futex_return(struct pt_regs *ctx) {
-    u64 tid = bpf_get_current_pid_tgid();
-    u64 *start_ts = lock_start.lookup(&tid);
-    if (!start_ts) return 0;
-
-    u64 delta = bpf_ktime_get_ns() - *start_ts;
-    lock_start.delete(&tid);
-
-    if (delta < 1000 || delta > 5000000000ULL) return 0;
-
-    u32 pid = tid >> 32;
-    struct proc_metrics *m = get_metrics(pid);
-    if (m) {
-        m->total_lock_wait_ns += delta;
-        m->lock_wait_count++;
-    }
-    return 0;
-}
-"""
-
-SERVICE_MAP = {
-    "python3": "ml-engine",
-    "node": "api-gateway",
-    "postgres": "database",
-    "redis-server": "cache",
-    "nginx": "load-balancer",
-    "java": "order-service",
-    "stress-ng": "stress-test",
-    "stress": "stress-test",
-    "sysbench": "benchmark",
-}
-
-EXCLUDE_PROCESSES = {"multipathd", "systemd", "kworker", "swapper", "ksoftirqd", "kthreadd"}
+# Common runtime interpreters where the binary name alone is uninformative
+INTERPRETERS = (
+    "python", "python3", "node", "nodejs", "ruby", "perl",
+    "bash", "sh", "zsh", "java", "uvicorn", "gunicorn", "celery", "flask", "dotnet"
+)
 
 
-def get_service_name(comm):
-    comm = comm.strip()
-    if comm in EXCLUDE_PROCESSES:
+def resolve_service_name(pid: int, comm: str) -> str | None:
+    """
+    Dynamically discover the real application or service name on any Linux/EC2 host:
+    1. Inspects /proc/<pid>/cgroup for systemd units (e.g. nginx.service -> nginx)
+       and container runtimes (e.g. docker-<id>.scope).
+    2. For interpreters (python, node, java), parses /proc/<pid>/cmdline to find
+       the actual script, module, or application being executed.
+    3. Falls back to a sanitized process name without hardcoding.
+    """
+    comm = comm.strip().strip("\x00")
+    if not comm or comm in IGNORED_KERNEL_COMM:
         return None
-    if comm in SERVICE_MAP:
-        return SERVICE_MAP[comm]
-    for key, service in SERVICE_MAP.items():
-        if comm.startswith(key):
-            return service
-    return comm
+
+    now = time.time()
+    if pid in _PID_SERVICE_CACHE:
+        cached_time, cached_name = _PID_SERVICE_CACHE[pid]
+        if now - cached_time < _CACHE_TTL_SECONDS:
+            return cached_name
+
+    service_name = _discover_service_from_proc(pid, comm)
+    _PID_SERVICE_CACHE[pid] = (now, service_name)
+    return service_name
+
+
+def _discover_service_from_proc(pid: int, comm: str) -> str:
+    # 1. Check systemd unit or container cgroup
+    cgroup_path = f"/proc/{pid}/cgroup"
+    if os.path.exists(cgroup_path):
+        try:
+            with open(cgroup_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if ".service" in line:
+                        part = line.split("/")[-1]
+                        if part.endswith(".service"):
+                            unit_name = part[:-8]
+                            if unit_name not in ("systemd", "init", "user@"):
+                                return unit_name
+                    if "/docker/" in line or "docker-" in line:
+                        cid = line.split("/")[-1].replace("docker-", "").replace(".scope", "")[:12]
+                        return f"docker-{cid}"
+        except Exception:
+            pass
+
+    # 2. For interpreters, check /proc/<pid>/cmdline for the executed script/app
+    cmdline_path = f"/proc/{pid}/cmdline"
+    if os.path.exists(cmdline_path):
+        try:
+            with open(cmdline_path, "rb") as f:
+                raw = f.read()
+            parts = [p.decode("utf-8", errors="ignore") for p in raw.split(b"\x00") if p]
+            if parts:
+                base_bin = os.path.basename(parts[0]).lower()
+                if any(base_bin.startswith(interp) for interp in INTERPRETERS):
+                    for arg in parts[1:]:
+                        if arg.startswith("-"):
+                            continue
+                        script_name = os.path.basename(arg)
+                        if script_name.endswith((".py", ".js", ".ts", ".rb", ".jar", ".sh")):
+                            return script_name.rsplit(".", 1)[0]
+                        if ":" in script_name:
+                            return script_name.split(":")[0]
+                        if len(script_name) > 2 and not script_name.startswith("/"):
+                            return script_name
+        except Exception:
+            pass
+
+    # 3. Clean up raw comm
+    clean = comm.replace("/", "-").rstrip("-").strip()
+    return clean or comm
 
 
 def format_ns(ns):
@@ -204,7 +138,7 @@ def collect_and_send(bpf_obj, endpoint=None):
         if not comm:
             continue
 
-        service = get_service_name(comm)
+        service = resolve_service_name(pid_val, comm)
         if service is None:
             continue
 
@@ -268,14 +202,30 @@ def main():
     parser.add_argument("--no-clear", action="store_true")
     args = parser.parse_args()
 
-    print("loading eBPF program...")
-    b = BPF(text=BPF_PROGRAM)
+    if BPF is None:
+        print("Error: BCC (python3-bpfcc) is required to run the collector.")
+        print("Please run this collector on a Linux host with kernel headers and BCC installed.")
+        sys.exit(1)
 
-    try:
-        b.attach_kprobe(event="do_futex", fn_name="trace_futex_enter")
-        b.attach_kretprobe(event="do_futex", fn_name="trace_futex_return")
-    except Exception as e:
-        print(f"futex kprobe unavailable: {e}")
+    if not os.path.exists(C_SOURCE_PATH):
+        print(f"Error: eBPF C program not found at {C_SOURCE_PATH}")
+        sys.exit(1)
+
+    print(f"loading eBPF program from {C_SOURCE_PATH}...")
+    b = BPF(src_file=C_SOURCE_PATH)
+
+    # Attach futex lock contention kprobes across kernel versions (do_futex on 5.x, sys_futex on 6.x)
+    futex_attached = False
+    for fn in ("do_futex", "__x64_sys_futex", "sys_futex", "__arm64_sys_futex"):
+        try:
+            b.attach_kprobe(event=fn, fn_name="trace_futex_enter")
+            b.attach_kretprobe(event=fn, fn_name="trace_futex_return")
+            futex_attached = True
+            break
+        except Exception:
+            continue
+    if not futex_attached:
+        print("Note: futex kprobe unavailable on this kernel symbol table.")
 
     print(f"collecting | interval={args.interval}s | endpoint={args.endpoint or 'local'}")
 
