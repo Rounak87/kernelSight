@@ -23,6 +23,7 @@ def health():
 
 
 @app.post("/api/v1/ingest")
+@app.post("/ingest")
 def ingest(batch: MetricBatch):
     if not batch.metrics:
         raise HTTPException(status_code=400, detail="empty metrics list")
